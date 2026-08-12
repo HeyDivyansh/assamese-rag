@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     sarvam_api_key: str = ""
     sarvam_base_url: str = "https://api.sarvam.ai"
     sarvam_stt_model: str = "saaras:v3"
-    sarvam_llm_model: str = "sarvam-30b"
+    sarvam_llm_model: str = "sarvam-105b"
 
     # --- Postgres ---
     postgres_url: str = (

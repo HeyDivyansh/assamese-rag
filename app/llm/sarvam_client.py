@@ -34,6 +34,19 @@ def _headers() -> dict:
     }
 
 
+def _err_detail(exc: Exception) -> str:
+    """Build a log-safe error string, including the API response body when the
+    failure is an HTTP status error (Sarvam returns the real reason in the body,
+    which ``str(exc)`` omits)."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            body = exc.response.text
+        except Exception:  # noqa: BLE001
+            body = ""
+        return f"{exc} | body={body[:500]}" if body else str(exc)
+    return str(exc)
+
+
 def _preview(text: str | None, n: int = 120) -> str:
     if not text:
         return ""
@@ -165,18 +178,21 @@ def sarvam_vision_ocr(
             return text, conf
         except Exception as exc:  # noqa: BLE001
             last_err = exc
+            detail = _err_detail(exc)
             dur = int((time.perf_counter() - started) * 1000)
             if db is not None:
                 record_stage_sync(
                     db, "ocr", status="failed", component="sarvam_vision",
                     duration_ms=dur, document_id=document_id, request_id=request_id,
                     input_summary={"page": page_number, "attempt": attempt},
-                    error_message=str(exc),
+                    error_message=detail,
                 )
-            log.warning("sarvam.vision.attempt_failed", attempt=attempt, error=str(exc))
+            log.warning("sarvam.vision.attempt_failed", attempt=attempt, error=detail)
             if attempt < _MAX_ATTEMPTS:
                 time.sleep(_BACKOFF_BASE * (2 ** (attempt - 1)))
-    raise RuntimeError(f"Sarvam Vision OCR failed after {_MAX_ATTEMPTS} attempts: {last_err}")
+    raise RuntimeError(
+        f"Sarvam Vision OCR failed after {_MAX_ATTEMPTS} attempts: {_err_detail(last_err)}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -233,6 +249,7 @@ async def transcribe(
             return out
         except Exception as exc:  # noqa: BLE001
             last_err = exc
+            detail = _err_detail(exc)
             dur = int((time.perf_counter() - started) * 1000)
             if db is not None:
                 await record_stage_async(
@@ -240,14 +257,16 @@ async def transcribe(
                     duration_ms=dur, conversation_id=conversation_id,
                     request_id=request_id,
                     input_summary={"audio_bytes": len(audio_bytes), "attempt": attempt},
-                    error_message=str(exc),
+                    error_message=detail,
                 )
-            log.warning("sarvam.stt.attempt_failed", attempt=attempt, error=str(exc))
+            log.warning("sarvam.stt.attempt_failed", attempt=attempt, error=detail)
             if attempt < _MAX_ATTEMPTS:
                 import asyncio
 
                 await asyncio.sleep(_BACKOFF_BASE * (2 ** (attempt - 1)))
-    raise RuntimeError(f"Sarvam STT failed after {_MAX_ATTEMPTS} attempts: {last_err}")
+    raise RuntimeError(
+        f"Sarvam STT failed after {_MAX_ATTEMPTS} attempts: {_err_detail(last_err)}"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -298,12 +317,13 @@ async def chat_completion(
             return answer
         except Exception as exc:  # noqa: BLE001
             last_err = exc
+            detail = _err_detail(exc)
             dur = int((time.perf_counter() - started) * 1000)
             if data is not None:
                 log.warning(
                     "sarvam.llm.parse_failed",
                     attempt=attempt,
-                    error=str(exc),
+                    error=detail,
                     response=_response_debug_summary(data),
                 )
             if db is not None:
@@ -312,14 +332,16 @@ async def chat_completion(
                     duration_ms=dur, conversation_id=conversation_id,
                     request_id=request_id,
                     input_summary={"messages": len(messages), "attempt": attempt},
-                    error_message=str(exc),
+                    error_message=detail,
                 )
-            log.warning("sarvam.llm.attempt_failed", attempt=attempt, error=str(exc))
+            log.warning("sarvam.llm.attempt_failed", attempt=attempt, error=detail)
             if attempt < _MAX_ATTEMPTS:
                 import asyncio
 
                 await asyncio.sleep(_BACKOFF_BASE * (2 ** (attempt - 1)))
-    raise RuntimeError(f"Sarvam LLM failed after {_MAX_ATTEMPTS} attempts: {last_err}")
+    raise RuntimeError(
+        f"Sarvam LLM failed after {_MAX_ATTEMPTS} attempts: {_err_detail(last_err)}"
+    )
 
 
 async def chat_completion_stream(
@@ -385,6 +407,6 @@ async def chat_completion_stream(
                 duration_ms=dur, conversation_id=conversation_id,
                 request_id=request_id,
                 input_summary={"messages": len(messages), "stream": True},
-                error_message=str(exc),
+                error_message=_err_detail(exc),
             )
         raise
