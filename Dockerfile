@@ -22,6 +22,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
+# Cache BGE-M3 tokenizer (~few MB) so chunking works without live HF Hub access.
+ENV HF_HOME=/root/.cache/huggingface \
+    TRANSFORMERS_CACHE=/root/.cache/huggingface/hub
+RUN python -c "from transformers import AutoTokenizer; AutoTokenizer.from_pretrained('BAAI/bge-m3')"
+
 COPY . .
 
 EXPOSE 8000

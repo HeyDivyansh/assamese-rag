@@ -5,17 +5,20 @@ Backends (first match wins):
   2. BGE_M3_* is http URL  -> custom /embed endpoint
   3. otherwise             -> local sentence-transformers (dev fallback only)
 
-The tokenizer is BGE-M3's own for chunk token counting (small vocab files only,
-not the ~2 GB embedding weights).
+Token counting uses the cached BGE-M3 tokenizer when present; otherwise a
+script-aware heuristic (no Hugging Face Hub access — avoids Docker DNS issues).
 """
 from __future__ import annotations
 
 import math
+import os
 import threading
+from pathlib import Path
 from typing import Any
 
 import httpx
 
+from app.cleaner.unicode import indic_script_ratio, latin_script_ratio
 from app.core.config import settings
 from app.core.logging import get_logger
 
@@ -25,6 +28,52 @@ _lock = threading.Lock()
 _model = None
 _tokenizer = None
 _hf_client = None
+
+
+class _ApproxTokenizer:
+    """Offline fallback when BGE-M3 tokenizer files are not cached."""
+
+    def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        if not text:
+            return []
+        indic = indic_script_ratio(text)
+        latin = latin_script_ratio(text)
+        # Indic scripts tend to tokenize denser than Latin in XLM-R.
+        chars_per_token = 2.5 if indic >= latin else 4.0
+        return list(range(max(1, int(len(text) / chars_per_token))))
+
+
+def _hf_hub_cache_root() -> Path:
+    for key in ("HF_HOME", "HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE"):
+        raw = os.environ.get(key)
+        if raw:
+            p = Path(raw)
+            return p / "hub" if p.name != "hub" and (p / "hub").is_dir() else p
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _cached_tokenizer_available(name: str) -> bool:
+    """True when tokenizer files are already on disk (no Hub round-trip)."""
+    model_dir = _hf_hub_cache_root() / f"models--{name.replace('/', '--')}"
+    if not model_dir.is_dir():
+        return False
+    return any(model_dir.rglob("tokenizer_config.json"))
+
+
+def _load_cached_tokenizer(name: str):
+    """Load tokenizer from local cache only — never contacts Hugging Face Hub."""
+    from transformers import AutoTokenizer
+
+    prev_offline = os.environ.get("HF_HUB_OFFLINE")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    try:
+        return AutoTokenizer.from_pretrained(name, local_files_only=True)
+    finally:
+        if prev_offline is None:
+            os.environ.pop("HF_HUB_OFFLINE", None)
+        else:
+            os.environ["HF_HUB_OFFLINE"] = prev_offline
 
 
 def _model_id() -> str:
@@ -88,10 +137,26 @@ def get_tokenizer():
         return _tokenizer
     with _lock:
         if _tokenizer is None:
-            from transformers import AutoTokenizer
-
             name = _model_id() if not _is_custom_endpoint() else "BAAI/bge-m3"
-            _tokenizer = AutoTokenizer.from_pretrained(name)
+            # HF Inference mode: never download tokenizer — heuristic is enough
+            # for chunk sizing and avoids flaky Docker DNS to huggingface.co.
+            if _use_hf_api() or not _cached_tokenizer_available(name):
+                if not _use_hf_api() and not _cached_tokenizer_available(name):
+                    log.warning(
+                        "bge_m3.tokenizer_offline_fallback",
+                        model=name,
+                        reason="cache_miss",
+                    )
+                else:
+                    log.info(
+                        "bge_m3.tokenizer_offline_fallback",
+                        model=name,
+                        reason="hf_inference_api",
+                    )
+                _tokenizer = _ApproxTokenizer()
+            else:
+                _tokenizer = _load_cached_tokenizer(name)
+                log.info("bge_m3.tokenizer", source="cache", model=name)
     return _tokenizer
 
 

@@ -16,6 +16,7 @@ from app.core.deps import get_current_user_id, get_request_id_dep
 from app.core.logging import get_logger
 from app.core.storage import put_bytes
 from app.llm import sarvam_client
+from app.cleaner.unicode import detect_query_language
 from app.llm.prompts import build_messages
 from app.models import Conversation, Document, Message
 from app.retrieval.pipeline import retrieve
@@ -170,7 +171,10 @@ async def chat_text(
         conversation_id=conv.id, request_id=request_id,
     )
     history = await _load_history(db, conv.id, settings.conversation_memory_turns)
-    messages = build_messages(body.message, chunks, history)
+    messages = build_messages(
+        body.message, chunks, history,
+        query_language=detect_query_language(body.message),
+    )
 
     answer = await sarvam_client.chat_completion(
         messages, db=db, conversation_id=conv.id, request_id=request_id
@@ -217,7 +221,10 @@ async def chat_text_stream(
                 history = await _load_history(
                     db, conv.id, settings.conversation_memory_turns
                 )
-                messages = build_messages(body.message, chunks, history)
+                messages = build_messages(
+                    body.message, chunks, history,
+                    query_language=detect_query_language(body.message),
+                )
 
                 answer_parts: list[str] = []
                 async for delta in sarvam_client.chat_completion_stream(
@@ -294,7 +301,10 @@ async def chat_voice(
         conversation_id=conv.id, request_id=request_id,
     )
     history = await _load_history(db, conv.id, settings.conversation_memory_turns)
-    messages = build_messages(transcript, chunks, history)
+    messages = build_messages(
+        transcript, chunks, history,
+        query_language=detect_query_language(transcript),
+    )
     answer = await sarvam_client.chat_completion(
         messages, db=db, conversation_id=conv.id, request_id=request_id
     )
@@ -367,7 +377,10 @@ async def chat_voice_stream(
                 history = await _load_history(
                     db, conv.id, settings.conversation_memory_turns
                 )
-                messages = build_messages(transcript, chunks, history)
+                messages = build_messages(
+                    transcript, chunks, history,
+                    query_language=detect_query_language(transcript),
+                )
 
                 answer_parts: list[str] = []
                 async for delta in sarvam_client.chat_completion_stream(

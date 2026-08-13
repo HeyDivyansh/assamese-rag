@@ -34,6 +34,33 @@ def indic_script_ratio(text: str) -> float:
     return len(_INDIC.findall(text)) / len(chars)
 
 
+def latin_script_ratio(text: str) -> float:
+    chars = [c for c in text if not c.isspace()]
+    if not chars:
+        return 0.0
+    return len(_LATIN.findall(text)) / len(chars)
+
+
+def detect_language(text: str, *, default: str = "as") -> str:
+    """Detect dominant language: ``as``, ``en``, or ``mixed``."""
+    indic = indic_script_ratio(text)
+    latin = latin_script_ratio(text)
+    if indic >= 0.15 and latin >= 0.15:
+        return "mixed"
+    if indic >= 0.15:
+        return "as"
+    if latin >= 0.15:
+        return "en"
+    return default
+
+
+def detect_query_language(query: str) -> str:
+    """Detect user query language: ``as`` or ``en``."""
+    if latin_script_ratio(query) > indic_script_ratio(query):
+        return "en"
+    return "as"
+
+
 def garbage_char_ratio(text: str) -> float:
     if not text:
         return 0.0
@@ -46,9 +73,10 @@ def quality_score(text: str) -> float:
         return 0.0
     indic = indic_script_ratio(text)
     garbage = garbage_char_ratio(text)
-    latin = len(_LATIN.findall(text)) / max(len(text.replace(" ", "")), 1)
-    # Mixed Assamese-English is OK; heavy garbage is not.
-    score = 0.5 * indic + 0.3 * (1.0 - garbage * 10) + 0.2 * min(latin + indic, 1.0)
+    latin = latin_script_ratio(text)
+    script = max(indic, latin)
+    # Mixed Assamese-English and English-only docs are OK; heavy garbage is not.
+    score = 0.5 * script + 0.3 * (1.0 - garbage * 10) + 0.2 * min(latin + indic, 1.0)
     return max(0.0, min(1.0, score))
 
 

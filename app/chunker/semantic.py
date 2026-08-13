@@ -6,7 +6,7 @@ import re
 import uuid
 
 from app.chunker.dedup import deduplicate_chunks, filter_noise, merge_tiny_chunks
-from app.cleaner.unicode import clean_text, is_embeddable, quality_score
+from app.cleaner.unicode import clean_text, detect_language, is_embeddable, quality_score
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.ingestion.embedding import count_tokens
@@ -175,7 +175,7 @@ def chunk_sections(
                     block_type=types[0] if types else "paragraph",
                     token_count=count_tokens(text),
                     quality_score=q,
-                    language=source_language,
+                    language=detect_language(text, default=source_language),
                     text_hash=_hash(text),
                     ocr_confidence=page_confidence.get(section.page_start),
                 )

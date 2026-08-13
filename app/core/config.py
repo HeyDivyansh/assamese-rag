@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     ocr_primary_engine: str = "paddleocr"
     ocr_fallback_engine: str = "sarvam_vision"
     ocr_confidence_threshold: float = 0.60
+    ocr_paddle_lang_indic: str = "devanagari"
+    ocr_paddle_lang_latin: str = "en"
 
     # --- Chunking (P0/P2) ---
     chunk_target_tokens: int = 400

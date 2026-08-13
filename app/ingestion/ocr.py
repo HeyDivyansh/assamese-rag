@@ -13,14 +13,20 @@ OCR_PRIMARY_ENGINE / OCR_FALLBACK_ENGINE env vars.
 from __future__ import annotations
 
 import io
-import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
+from app.cleaner.unicode import indic_script_ratio, latin_script_ratio
 from app.core.config import settings
 from app.core.logging import get_logger
 
 log = get_logger(__name__)
+
+# PaddleOCR 2.9+ removed per-language codes like ``bn``; Indic OCR uses ``devanagari``.
+_PADDLE_LANGS = frozenset({
+    "ch", "en", "korean", "japan", "chinese_cht", "ta", "te", "ka",
+    "latin", "arabic", "cyrillic", "devanagari",
+})
 
 
 @dataclass
@@ -46,19 +52,6 @@ class OCRResult:
         return sum(p.confidence for p in self.pages) / len(self.pages)
 
 
-# Bengali/Assamese script (Eastern Nagari) + Devanagari (reject garbled OCR).
-_INDIC_SCRIPT_RE = re.compile(r"[\u0980-\u09FF\u0900-\u097F]")
-
-
-def _indic_script_ratio(text: str) -> float:
-    if not text:
-        return 0.0
-    chars = [c for c in text if not c.isspace()]
-    if not chars:
-        return 0.0
-    return len(_INDIC_SCRIPT_RE.findall(text)) / len(chars)
-
-
 def extract_pdf_text_pages(pdf_bytes: bytes) -> list[PageOCR]:
     """Extract embedded PDF text (digital PDFs) without OCR."""
     import pypdfium2 as pdfium
@@ -77,20 +70,45 @@ def extract_pdf_text_pages(pdf_bytes: bytes) -> list[PageOCR]:
 
 
 def _should_use_text_layer(text: str) -> bool:
-    """Use native PDF text when it looks like real Indic content, not empty."""
+    """Use native PDF text when it looks like real content, not empty."""
     stripped = text.strip()
     if len(stripped) < 20:
         return False
-    return _indic_script_ratio(stripped) >= 0.20
+    return (
+        indic_script_ratio(stripped) >= 0.20
+        or latin_script_ratio(stripped) >= 0.20
+    )
 
 
 def _page_needs_fallback(page: PageOCR) -> bool:
     """Confidence alone is not enough — garbled OCR can still score high."""
     if page.confidence < settings.ocr_confidence_threshold:
         return True
-    if len(page.text.strip()) > 40 and _indic_script_ratio(page.text) < 0.15:
-        return True
+    if len(page.text.strip()) > 40:
+        indic = indic_script_ratio(page.text)
+        latin = latin_script_ratio(page.text)
+        if indic < 0.15 and latin < 0.15:
+            return True
     return False
+
+
+def _paddle_lang_for_page(
+    native_text: str | None,
+    *,
+    document_hint: str | None = None,
+) -> str:
+    """Pick PaddleOCR lang from page text, then whole-document hint."""
+    for text in (native_text, document_hint):
+        stripped = (text or "").strip()
+        if len(stripped) < 20:
+            continue
+        latin = latin_script_ratio(stripped)
+        indic = indic_script_ratio(stripped)
+        if latin >= 0.20 and latin >= indic:
+            return settings.ocr_paddle_lang_latin
+        if indic >= 0.15:
+            return settings.ocr_paddle_lang_indic
+    return settings.ocr_paddle_lang_indic
 
 
 def pdf_to_images(pdf_bytes: bytes, dpi: int = 200) -> list["PIL.Image.Image"]:  # noqa: F821
@@ -120,15 +138,23 @@ class OcrEngine(ABC):
 class PaddleOcrEngine(OcrEngine):
     name = "paddleocr"
 
-    def __init__(self) -> None:
+    def __init__(self, lang: str | None = None) -> None:
+        lang = lang or settings.ocr_paddle_lang_indic
+        if lang not in _PADDLE_LANGS:
+            raise ValueError(
+                f"Unsupported PaddleOCR lang {lang!r}; "
+                f"choose one of {sorted(_PADDLE_LANGS)}"
+            )
+        self._lang = lang
         self._ocr = None
 
     def _get(self):
         if self._ocr is None:
             from paddleocr import PaddleOCR
 
-            # Assamese uses Bengali/Eastern-Nagari script — use `bn`, not devanagari.
-            self._ocr = PaddleOCR(use_angle_cls=True, lang="bn")
+            # Assamese uses Eastern Nagari script; PaddleOCR 2.9+ maps Indic OCR
+            # to ``devanagari`` (``bn`` was removed).
+            self._ocr = PaddleOCR(use_angle_cls=True, lang=self._lang)
         return self._ocr
 
     def ocr_image(self, image, page_number: int) -> PageOCR:
@@ -179,10 +205,18 @@ _ENGINES = {
     "none": NullEngine,
 }
 
+_paddle_by_lang: dict[str, PaddleOcrEngine] = {}
+
 
 def _make_engine(name: str) -> OcrEngine:
     cls = _ENGINES.get(name, NullEngine)
     return cls()
+
+
+def _get_paddle_engine(lang: str) -> PaddleOcrEngine:
+    if lang not in _paddle_by_lang:
+        _paddle_by_lang[lang] = PaddleOcrEngine(lang=lang)
+    return _paddle_by_lang[lang]
 
 
 def run_ocr(pdf_bytes: bytes) -> OCRResult:
@@ -192,6 +226,7 @@ def run_ocr(pdf_bytes: bytes) -> OCRResult:
     fallback = _make_engine(fallback_name) if fallback_name != "none" else None
 
     native_pages = extract_pdf_text_pages(pdf_bytes)
+    document_hint = " ".join(p.text for p in native_pages if p.text.strip())
     images = pdf_to_images(pdf_bytes)
     result = OCRResult()
     for idx, image in enumerate(images, start=1):
@@ -201,36 +236,46 @@ def run_ocr(pdf_bytes: bytes) -> OCRResult:
                 "ocr.used_pdf_text_layer",
                 page=idx,
                 chars=len(native.text),
-                indic_ratio=round(_indic_script_ratio(native.text), 3),
+                indic_ratio=round(indic_script_ratio(native.text), 3),
             )
             result.pages.append(
                 PageOCR(idx, native.text, 0.98, "pdf_text_layer")
             )
             continue
 
-        page = primary.ocr_image(image, idx)
+        if settings.ocr_primary_engine == "paddleocr":
+            paddle_lang = _paddle_lang_for_page(
+                native.text if native else None,
+                document_hint=document_hint,
+            )
+            page = _get_paddle_engine(paddle_lang).ocr_image(image, idx)
+        else:
+            page = primary.ocr_image(image, idx)
         if fallback is not None and _page_needs_fallback(page):
             log.warning(
                 "ocr.low_confidence_fallback",
                 page=idx,
                 primary=primary.name,
                 confidence=round(page.confidence, 3),
-                indic_ratio=round(_indic_script_ratio(page.text), 3),
+                indic_ratio=round(indic_script_ratio(page.text), 3),
                 fallback=fallback.name,
             )
             fb = fallback.ocr_image(image, idx)
-            # Prefer fallback when it has more Indic script or higher confidence.
-            if (
-                _indic_script_ratio(fb.text) > _indic_script_ratio(page.text)
-                or fb.confidence >= page.confidence
-            ):
+            # Prefer fallback when it has more script signal or higher confidence.
+            page_script = max(
+                indic_script_ratio(page.text), latin_script_ratio(page.text)
+            )
+            fb_script = max(
+                indic_script_ratio(fb.text), latin_script_ratio(fb.text)
+            )
+            if fb_script > page_script or fb.confidence >= page.confidence:
                 page = fb
         log.info(
             "ocr.page_done",
             page=idx,
             engine=page.engine,
             confidence=round(page.confidence, 3),
-            indic_ratio=round(_indic_script_ratio(page.text), 3),
+            indic_ratio=round(indic_script_ratio(page.text), 3),
             chars=len(page.text),
         )
         result.pages.append(page)

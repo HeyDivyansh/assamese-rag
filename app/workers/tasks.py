@@ -92,6 +92,7 @@ def ingest_document(
 
             doc.page_count = artifacts.profile.page_count or len(artifacts.pages)
             doc.document_type = artifacts.profile.document_type
+            doc.language = artifacts.detected_language
             _set_status(db, doc, "structuring")
 
             drafts = artifacts.chunks

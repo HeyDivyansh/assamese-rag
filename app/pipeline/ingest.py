@@ -6,7 +6,12 @@ from dataclasses import dataclass
 
 from app.chunker.semantic import chunk_sections
 from app.cleaner.headers import strip_headers_footers
-from app.cleaner.unicode import clean_text, indic_script_ratio
+from app.cleaner.unicode import (
+    clean_text,
+    detect_language,
+    indic_script_ratio,
+    latin_script_ratio,
+)
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.ingestion.ocr import run_ocr
@@ -25,6 +30,7 @@ class IngestArtifacts:
     sections: list
     chunks: list[ChunkDraft]
     page_confidence: dict[int, float]
+    detected_language: str = "as"
 
 
 def _merge_parsed_with_ocr(
@@ -36,7 +42,10 @@ def _merge_parsed_with_ocr(
         pn = page.page_number
         ocr_txt, ocr_conf = ocr_by_page.get(pn, ("", 0.0))
         use_ocr = (
-            page.indic_ratio < 0.15
+            (
+                page.indic_ratio < 0.15
+                and latin_script_ratio(page.text) < 0.15
+            )
             or len(page.text.strip()) < 20
         ) and ocr_txt.strip()
         if use_ocr:
@@ -76,15 +85,20 @@ def run_ingestion_pipeline(pdf_bytes: bytes) -> IngestArtifacts:
     pages = strip_headers_footers(pages)
     pages = classify_blocks(pages)
     sections = detect_sections(pages)
+    combined_text = "\n".join(p.text for p in pages if p.text.strip())
+    detected_language = detect_language(
+        combined_text, default=settings.default_document_language
+    )
     chunks = chunk_sections(
         sections,
         document_type=profile.document_type,
-        source_language=settings.default_document_language,
+        source_language=detected_language,
         page_confidence=page_conf,
     )
     log.info(
         "pipeline.ingest",
         document_type=profile.document_type,
+        detected_language=detected_language,
         pages=len(pages),
         sections=len(sections),
         chunks=len(chunks),
@@ -95,4 +109,5 @@ def run_ingestion_pipeline(pdf_bytes: bytes) -> IngestArtifacts:
         sections=sections,
         chunks=chunks,
         page_confidence=page_conf,
+        detected_language=detected_language,
     )

@@ -16,7 +16,9 @@ def detect_profile(pdf_bytes: bytes) -> DocumentProfile:
         return DocumentProfile(document_type="scanned_pdf", page_count=0)
     ratios = [p.indic_ratio for p in pages if p.text.strip()]
     avg = sum(ratios) / len(ratios) if ratios else 0.0
-    digital = sum(1 for p in pages if p.engine == "pymupdf" and p.indic_ratio >= 0.15)
+    digital = sum(
+        1 for p in pages if p.engine == "pymupdf" and len(p.text.strip()) >= 20
+    )
     scanned = len(pages) - digital
     bookmarks = bool(extract_bookmarks(pdf_bytes))
     tables = extract_tables(pdf_bytes)
