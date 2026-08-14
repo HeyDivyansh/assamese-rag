@@ -9,6 +9,8 @@ Every external call is:
 """
 from __future__ import annotations
 
+import asyncio
+import base64
 import hashlib
 import json
 import time
@@ -267,7 +269,58 @@ async def transcribe(
     raise RuntimeError(
         f"Sarvam STT failed after {_MAX_ATTEMPTS} attempts: {_err_detail(last_err)}"
     )
+# --------------------------------------------------------------------------- #
+# TTS: Sarvam Bulbul v3
+# --------------------------------------------------------------------------- #
+async def text_to_speech(
+    text: str,
+    language_code: str,
+) -> bytes:
+    """
+    Convert assistant text to speech using Sarvam Bulbul v3.
 
+    language_code comes from STT:
+        en-IN
+        hi-IN
+        kn-IN
+    """
+
+    supported_languages = {
+        "en-IN",
+        "hi-IN",
+        "kn-IN",
+    }
+
+    if language_code not in supported_languages:
+        language_code = "en-IN"
+
+    url = settings.sarvam_base_url.rstrip("/") + "/text-to-speech"
+
+    payload = {
+        "text": text,
+        "target_language_code": language_code,
+        "speaker": "shubh",
+        "model": settings.sarvam_tts_model,
+        "output_audio_codec": "wav",
+    }
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        response = await client.post(
+            url,
+            headers={
+                "api-subscription-key": settings.sarvam_api_key,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+    audio_base64 = data["audios"][0]
+
+    return base64.b64decode(audio_base64)
 
 # --------------------------------------------------------------------------- #
 # LLM: sarvam-30b chat completion (async)

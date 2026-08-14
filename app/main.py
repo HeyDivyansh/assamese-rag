@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
+from fastapi.responses import FileResponse
 
 from app.api import chat, conversations, documents, health
 from app.core.clients import ensure_opensearch_index, ensure_qdrant_collection
@@ -133,3 +134,6 @@ app.openapi = custom_openapi
 @app.get("/", include_in_schema=False)
 async def root():
     return {"service": "assamese-rag", "docs": "/docs", "openapi": "/openapi.json"}
+@app.get("/stt-test")
+async def stt_test():
+    return FileResponse("app/static/stt_test.html")

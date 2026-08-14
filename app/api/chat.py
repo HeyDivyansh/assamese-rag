@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+import base64
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import func, select
@@ -288,14 +289,24 @@ async def chat_voice(
     conv = await _get_or_create_conversation(db, conversation_id, user_id, "Voice chat")
 
     stt = await sarvam_client.transcribe(
-        audio, filename=file.filename or "audio.wav",
+        audio,
+        filename=file.filename or "audio.wav",
         content_type=file.content_type or "audio/wav",
-        db=db, conversation_id=conv.id, request_id=request_id,
+        db=db,
+        conversation_id=conv.id,
+        request_id=request_id,
     )
-    transcript = stt["transcript"]
-    if not transcript.strip():
-        raise HTTPException(status_code=422, detail="Could not transcribe audio")
 
+    transcript = stt["transcript"]
+
+    if not transcript.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="Could not transcribe audio",
+        )
+
+    language_code = stt.get("language_code") or "en-IN"
+    
     _cleaned, chunks = await retrieve(
         db, transcript, user_id, document_ids=doc_ids,
         conversation_id=conv.id, request_id=request_id,
@@ -307,6 +318,10 @@ async def chat_voice(
     )
     answer = await sarvam_client.chat_completion(
         messages, db=db, conversation_id=conv.id, request_id=request_id
+    )
+    audio_answer = await sarvam_client.text_to_speech(
+        text=answer,
+        language_code=language_code,
     )
     latency_ms = int((time.perf_counter() - started) * 1000)
 
@@ -321,6 +336,7 @@ async def chat_voice(
         transcript=transcript,
         answer=answer,
         sources=_build_sources(chunks, name_map),
+        audio_base64=base64.b64encode(audio_answer).decode("utf-8"),
     )
 
 
@@ -411,7 +427,45 @@ async def chat_voice_stream(
                 yield {"event": "error", "data": json.dumps({"detail": str(exc)})}
 
     return EventSourceResponse(event_gen())
+# --------------------------------------------------------------------------- #
+# Voice — STT only
+# --------------------------------------------------------------------------- #
+@router.post("/voice/transcribe", summary="Transcribe microphone audio")
+async def transcribe_voice(
+    file: UploadFile = File(...),
+    user_id: uuid.UUID = Depends(get_current_user_id),
+    request_id: str = Depends(get_request_id_dep),
+    db: AsyncSession = Depends(get_db),
+):
+    audio = await file.read()
 
+    if not audio:
+        raise HTTPException(
+            status_code=400,
+            detail="Empty audio file",
+        )
+
+    result = await sarvam_client.transcribe(
+        audio,
+        filename=file.filename or "recording.webm",
+        content_type=file.content_type or "audio/webm",
+        db=db,
+        request_id=request_id,
+    )
+
+    transcript = result.get("transcript", "")
+
+    if not transcript.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="Could not transcribe audio",
+        )
+
+    return {
+        "transcript": transcript,
+        "language_code": result.get("language_code"),
+        "confidence": result.get("confidence"),
+    }
 
 def _parse_doc_ids(raw: str | None) -> list[uuid.UUID] | None:
     if not raw:

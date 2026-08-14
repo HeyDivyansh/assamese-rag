@@ -34,6 +34,7 @@ class ChatVoiceResponse(BaseModel):
     transcript: str
     answer: str
     sources: list[SourceRef] = []
+    audio_base64: str | None = None
 
 
 class ConversationOut(BaseModel):
