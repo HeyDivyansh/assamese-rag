@@ -55,11 +55,20 @@ def detect_language(text: str, *, default: str = "as") -> str:
 
 
 def detect_query_language(query: str) -> str:
-    """Detect user query language: ``as`` or ``en``."""
-    if latin_script_ratio(query) > indic_script_ratio(query):
+    """Detect user query language from script."""
+    if not query.strip():
         return "en"
-    return "as"
 
+    indic = indic_script_ratio(query)
+    latin = latin_script_ratio(query)
+
+    if latin > indic:
+        return "en"
+
+    # Currently treat Indic-script queries as Indic.
+    # The actual spoken language (Hindi/Kannada/Assamese/etc.)
+    # should come from Saaras STT's detected language_code.
+    return "indic"
 
 def garbage_char_ratio(text: str) -> float:
     if not text:

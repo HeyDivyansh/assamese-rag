@@ -1,10 +1,10 @@
-"""Sarvam AI client wrappers: Saaras v3 STT, sarvam-30b chat, Vision OCR.
+﻿"""Sarvam AI client wrappers: Saaras v3 STT, sarvam-30b chat, Vision OCR.
 
 Every external call is:
   * time-bounded and retried with exponential backoff (3 attempts),
   * logged per-attempt into pipeline_stage_logs (logging rule #5) when a db
     session + correlation ids are supplied,
-  * summarized safely — we log lengths/hashes/previews, never full audio or
+  * summarized safely â€” we log lengths/hashes/previews, never full audio or
     document text (logging rule #2).
 """
 from __future__ import annotations
@@ -136,7 +136,7 @@ def _extract_stream_delta(chunk: dict) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-# Vision OCR fallback (sync — used by ingestion worker)
+# Vision OCR fallback (sync â€” used by ingestion worker)
 # --------------------------------------------------------------------------- #
 def sarvam_vision_ocr(
     image_png: bytes,
@@ -150,7 +150,7 @@ def sarvam_vision_ocr(
 
     Returns (text, confidence). Confidence from Sarvam Vision is treated as high
     (0.9) when the call succeeds, since the API does not always return a numeric
-    score — TODO: replace with a real per-page score if/when exposed.
+    score â€” TODO: replace with a real per-page score if/when exposed.
     """
     # TODO(endpoint): Confirm the exact Sarvam Vision/doc-intelligence route.
     url = settings.sarvam_base_url.rstrip("/") + "/v1/vision/ocr"
@@ -198,7 +198,7 @@ def sarvam_vision_ocr(
 
 
 # --------------------------------------------------------------------------- #
-# STT: Saaras v3 (async — used by voice chat)
+# STT: Saaras v3 (async â€” used by voice chat)
 # --------------------------------------------------------------------------- #
 async def transcribe(
     audio_bytes: bytes,
@@ -209,65 +209,119 @@ async def transcribe(
     conversation_id: uuid.UUID | None = None,
     request_id: str | uuid.UUID | None = None,
 ) -> dict:
-    """Transcribe Assamese audio (as-IN, mode=transcribe). Returns dict with
-    keys: transcript, language_code, confidence."""
-    url = settings.sarvam_base_url.rstrip("/") + "/speech-to-text-translate"
+    """Transcribe multilingual audio using Sarvam Saaras v3.
+
+    Uses automatic language detection so the same endpoint can handle
+    English, Hindi, Kannada, Assamese, etc.
+    """
+    url = settings.sarvam_base_url.rstrip("/") + "/speech-to-text"
+
     last_err: Exception | None = None
+
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         started = time.perf_counter()
+
         try:
             async with httpx.AsyncClient(timeout=180) as client:
                 resp = await client.post(
                     url,
                     headers=_headers(),
-                    files={"file": (filename, audio_bytes, content_type)},
+                    files={
+                        "file": (
+                            filename,
+                            audio_bytes,
+                            content_type,
+                        )
+                    },
                     data={
                         "model": settings.sarvam_stt_model,
                         "mode": "transcribe",
-                        "language_code": "as-IN",
+                        "language_code": "unknown",
                     },
                 )
+
                 resp.raise_for_status()
                 payload = resp.json()
-            transcript = payload.get("transcript") or payload.get("text") or ""
+
+            transcript = (
+                payload.get("transcript")
+                or payload.get("text")
+                or ""
+            )
+
             out = {
                 "transcript": transcript,
-                "language_code": payload.get("language_code", "as-IN"),
-                "confidence": payload.get("language_confidence"),
+                "language_code": payload.get("language_code"),
+                "confidence": payload.get("language_probability"),
             }
+
             dur = int((time.perf_counter() - started) * 1000)
+
             if db is not None:
                 await record_stage_async(
-                    db, "stt", status="success", component="saaras_v3",
-                    duration_ms=dur, conversation_id=conversation_id,
+                    db,
+                    "stt",
+                    status="success",
+                    component="saaras_v3",
+                    duration_ms=dur,
+                    conversation_id=conversation_id,
                     request_id=request_id,
-                    input_summary={"audio_bytes": len(audio_bytes), "attempt": attempt},
+                    input_summary={
+                        "audio_bytes": len(audio_bytes),
+                        "attempt": attempt,
+                    },
                     output_summary={
                         **_summary(transcript),
+                        "language_code": out["language_code"],
                         "language_confidence": out["confidence"],
                     },
                 )
-            log.info("sarvam.stt.ok", duration_ms=dur, chars=len(transcript))
+
+            log.info(
+                "sarvam.stt.ok",
+                duration_ms=dur,
+                chars=len(transcript),
+                language_code=out["language_code"],
+                language_confidence=out["confidence"],
+            )
+
             return out
-        except Exception as exc:  # noqa: BLE001
+
+        except Exception as exc:
             last_err = exc
             detail = _err_detail(exc)
             dur = int((time.perf_counter() - started) * 1000)
+
             if db is not None:
                 await record_stage_async(
-                    db, "stt", status="failed", component="saaras_v3",
-                    duration_ms=dur, conversation_id=conversation_id,
+                    db,
+                    "stt",
+                    status="failed",
+                    component="saaras_v3",
+                    duration_ms=dur,
+                    conversation_id=conversation_id,
                     request_id=request_id,
-                    input_summary={"audio_bytes": len(audio_bytes), "attempt": attempt},
+                    input_summary={
+                        "audio_bytes": len(audio_bytes),
+                        "attempt": attempt,
+                    },
                     error_message=detail,
                 )
-            log.warning("sarvam.stt.attempt_failed", attempt=attempt, error=detail)
-            if attempt < _MAX_ATTEMPTS:
-                import asyncio
 
-                await asyncio.sleep(_BACKOFF_BASE * (2 ** (attempt - 1)))
+            log.warning(
+                "sarvam.stt.attempt_failed",
+                attempt=attempt,
+                error=detail,
+            )
+
+            if attempt < _MAX_ATTEMPTS:
+                await asyncio.sleep(
+                    _BACKOFF_BASE * (2 ** (attempt - 1))
+                )
+
     raise RuntimeError(
-        f"Sarvam STT failed after {_MAX_ATTEMPTS} attempts: {_err_detail(last_err)}"
+        f"Sarvam STT failed after {_MAX_ATTEMPTS} attempts: "
+        f"{_err_detail(last_err)}"
     )
 # --------------------------------------------------------------------------- #
 # TTS: Sarvam Bulbul v3
@@ -281,14 +335,14 @@ async def text_to_speech(
 
     language_code comes from STT:
         en-IN
-        hi-IN
         kn-IN
+
     """
 
     supported_languages = {
         "en-IN",
-        "hi-IN",
         "kn-IN",
+
     }
 
     if language_code not in supported_languages:
@@ -327,7 +381,62 @@ async def text_to_speech(
 # --------------------------------------------------------------------------- #
 def _chat_url() -> str:
     return settings.sarvam_base_url.rstrip("/") + "/v1/chat/completions"
+async def route_query(
+    query: str,
+    *,
+    db=None,
+    request_id: str | uuid.UUID | None = None,
+) -> str:
+    """
+    Decide whether the user's query needs document retrieval.
 
+    Returns:
+        "rag"          -> use document retrieval
+        "conversation" -> answer directly using general knowledge
+    """
+
+    router_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a query router for a voice assistant.\n"
+                "Return ONLY one word: rag or conversation.\n\n"
+                "Return 'rag' when the user asks about information that "
+                "could come from uploaded documents, projects, policies, "
+                "fees, attendance, rules, reports, MIS, Copilot, or any "
+                "specific information stored in the documents.\n"
+                "Return 'conversation' for greetings, small talk, general "
+                "knowledge, casual questions, opinions, jokes, or questions "
+                "that do not require the uploaded documents."
+            ),
+                    },
+        {
+            "role": "user",
+            "content": query,
+        },
+    ]
+
+    result = await chat_completion(
+        router_messages,
+        db=db,
+        request_id=request_id,
+    )
+
+    result = result.strip().lower()
+
+    if result == "rag":
+        return "rag"
+
+    if result == "conversation":
+        return "conversation"
+
+    # Handle accidental extra text from the router model.
+    first_word = result.split()[0] if result.split() else ""
+
+    if first_word == "rag":
+        return "rag"
+
+    return "conversation"
 
 async def chat_completion(
     messages: list[dict],

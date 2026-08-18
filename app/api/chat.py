@@ -1,4 +1,4 @@
-"""Chat endpoints: text/voice, streaming/non-streaming (spec §4, §5 Chat)."""
+﻿"""Chat endpoints: text/voice, streaming/non-streaming (spec Â§4, Â§5 Chat)."""
 from __future__ import annotations
 
 import json
@@ -151,7 +151,7 @@ async def _persist_turn(
 
 
 # --------------------------------------------------------------------------- #
-# Text — non-streaming
+# Text â€” non-streaming
 # --------------------------------------------------------------------------- #
 @router.post(
     "/text", response_model=ChatTextResponse, summary="Chat over documents (text)"
@@ -195,7 +195,7 @@ async def chat_text(
 
 
 # --------------------------------------------------------------------------- #
-# Text — streaming (SSE)
+# Text â€” streaming (SSE)
 # --------------------------------------------------------------------------- #
 @router.post("/text/stream", summary="Chat over documents (text, SSE stream)")
 async def chat_text_stream(
@@ -259,7 +259,7 @@ async def chat_text_stream(
 
 
 # --------------------------------------------------------------------------- #
-# Voice — non-streaming
+# Voice â€” non-streaming
 # --------------------------------------------------------------------------- #
 @router.post(
     "/voice", response_model=ChatVoiceResponse,
@@ -282,7 +282,7 @@ async def chat_voice(
 
     doc_ids = _parse_doc_ids(document_ids)
 
-    # Persist raw audio to S3 (never logged raw — spec §6 privacy rule).
+    # Persist raw audio to S3 (never logged raw â€” spec Â§6 privacy rule).
     audio_key = f"voice/{user_id}/{uuid.uuid4()}/{file.filename or 'audio.wav'}"
     put_bytes(audio_key, audio, file.content_type or "audio/wav")
 
@@ -305,16 +305,88 @@ async def chat_voice(
             detail="Could not transcribe audio",
         )
 
-    language_code = stt.get("language_code") or "en-IN"
-    
-    _cleaned, chunks = await retrieve(
-        db, transcript, user_id, document_ids=doc_ids,
-        conversation_id=conv.id, request_id=request_id,
+    # Voice control commands â€” handle before RAG/LLM/TTS.
+    # Supports English, Hindi, Kannada, and Assamese.
+    stop_commands = {
+        # English
+        "stop",
+        "stop listening",
+        "cancel",
+        "exit",
+        "quit",
+
+        # Hindi
+        "à¤°à¥à¤•à¥‹",
+        "à¤°à¥à¤• à¤œà¤¾à¤“",
+        "à¤¬à¤‚à¤¦ à¤•à¤°à¥‹",
+        "à¤¬à¤‚à¤¦ à¤•à¤° à¤¦à¥‹",
+        "à¤°à¥à¤•à¤¿à¤",
+
+        # Kannada
+        "à²¨à²¿à²²à³à²²à²¿à²¸à³",
+        "à²¨à²¿à²²à³à²²à²¿à²¸à²¿",
+        "à²¨à²¿à²²à³à²²à²¿à²¸à³ à²•à³‡à²³à³à²µà³à²¦à²¨à³à²¨à³",
+
+        # Assamese
+        "à§°'à¦¬à¦¾",
+        "à§°à¦¬à¦¾",
+        "à§°à§ˆ à¦¯à§‹à§±à¦¾",
+        "à§°à§ˆ à¦¯à¦¾à¦“à¦•",
+        "à¦¬à¦¨à§à¦§ à¦•à§°à¦¾",
+        "à¦¬à¦¨à§à¦§ à¦•à§°à¦•",
+        "à¦¬à¦¨à§à¦§ à¦•à§°",
+    }
+
+    normalized_transcript = " ".join(
+        transcript.lower().strip().split()
     )
-    history = await _load_history(db, conv.id, settings.conversation_memory_turns)
+
+    if normalized_transcript in stop_commands:
+        return ChatVoiceResponse(
+            conversation_id=conv.id,
+            transcript=transcript,
+            answer="Okay, stopping.",
+            sources=[],
+            audio_base64="",
+        )
+
+    language_code = (
+        stt.get("language_code") or "en-IN"
+    )
+
+    if language_code not in {"en-IN", "kn-IN"}:
+        language_code = "en-IN"
+    intent = await sarvam_client.route_query(
+        transcript,
+        db=db,
+        request_id=request_id,
+    )
+
+
+
+    history = await _load_history(
+        db,
+        conv.id,
+        settings.conversation_memory_turns,
+    )
+
+    if intent == "rag":
+        _cleaned, chunks = await retrieve(
+            db,
+            transcript,
+            user_id,
+            document_ids=doc_ids,
+            conversation_id=conv.id,
+            request_id=request_id,
+        )
+    else:
+        chunks = []
+
     messages = build_messages(
-        transcript, chunks, history,
-        query_language=detect_query_language(transcript),
+        transcript,
+        chunks,
+        history,
+        query_language=language_code,
     )
     answer = await sarvam_client.chat_completion(
         messages, db=db, conversation_id=conv.id, request_id=request_id
@@ -341,7 +413,7 @@ async def chat_voice(
 
 
 # --------------------------------------------------------------------------- #
-# Voice — streaming (SSE): partial transcript, then answer tokens
+# Voice â€” streaming (SSE): partial transcript, then answer tokens
 # --------------------------------------------------------------------------- #
 @router.post("/voice/stream", summary="Chat over documents (voice, SSE stream)")
 async def chat_voice_stream(
@@ -352,83 +424,247 @@ async def chat_voice_stream(
     request_id: str = Depends(get_request_id_dep),
 ):
     audio = await file.read()
+
     if not audio:
-        raise HTTPException(status_code=400, detail="Empty audio file")
+        raise HTTPException(
+            status_code=400,
+            detail="Empty audio file",
+        )
+
     filename = file.filename or "audio.wav"
     content_type = file.content_type or "audio/wav"
     doc_ids = _parse_doc_ids(document_ids)
 
     async def event_gen():
         started = time.perf_counter()
+
         async with AsyncSessionLocal() as db:
             try:
-                audio_key = f"voice/{user_id}/{uuid.uuid4()}/{filename}"
-                put_bytes(audio_key, audio, content_type)
+                audio_key = (
+                    f"voice/{user_id}/{uuid.uuid4()}/{filename}"
+                )
+
+                put_bytes(
+                    audio_key,
+                    audio,
+                    content_type,
+                )
 
                 conv = await _get_or_create_conversation(
-                    db, conversation_id, user_id, "Voice chat"
+                    db,
+                    conversation_id,
+                    user_id,
+                    "Voice chat",
                 )
-                yield {"event": "conversation", "data": json.dumps(
-                    {"conversation_id": str(conv.id)})}
+
+                yield {
+                    "event": "conversation",
+                    "data": json.dumps(
+                        {
+                            "conversation_id": str(conv.id)
+                        }
+                    ),
+                }
+
+                # ---------------------------------------------------------
+                # STT
+                # ---------------------------------------------------------
 
                 stt = await sarvam_client.transcribe(
-                    audio, filename=filename, content_type=content_type,
-                    db=db, conversation_id=conv.id, request_id=request_id,
+                    audio,
+                    filename=filename,
+                    content_type=content_type,
+                    db=db,
+                    conversation_id=conv.id,
+                    request_id=request_id,
                 )
+
                 transcript = stt["transcript"]
-                # TODO(stt-stream): emit incremental partials once the Saaras
-                # streaming socket is wired; for now we send the final transcript.
-                yield {"event": "transcript", "data": json.dumps(
-                    {"transcript": transcript})}
+
+                language_code = stt.get("language_code") or "en-IN"
+
+                if language_code not in {"en-IN", "kn-IN"}:
+                    language_code = "en-IN"
+
+                log.info(
+                    "voice.language_detected",
+                    language_code=language_code,
+                    transcript_chars=len(transcript),
+                )
+
+                yield {
+                    "event": "transcript",
+                    "data": json.dumps(
+                        {
+                            "transcript": transcript,
+                            "language_code": language_code,
+                        }
+                    ),
+                }
 
                 if not transcript.strip():
-                    yield {"event": "error", "data": json.dumps(
-                        {"detail": "Could not transcribe audio"})}
+                    yield {
+                        "event": "error",
+                        "data": json.dumps(
+                            {
+                                "detail": "Could not transcribe audio"
+                            }
+                        ),
+                    }
                     return
 
-                _cleaned, chunks = await retrieve(
-                    db, transcript, user_id, document_ids=doc_ids,
-                    conversation_id=conv.id, request_id=request_id,
+                # ---------------------------------------------------------
+                # ROUTER
+                # ---------------------------------------------------------
+
+                intent = await sarvam_client.route_query(
+                    transcript,
+                    db=db,
+                    request_id=request_id,
                 )
+
+                log.info(
+                    "voice.query_routed",
+                    intent=intent,
+                )
+
+                # ---------------------------------------------------------
+                # Conversation history
+                # ---------------------------------------------------------
+
                 history = await _load_history(
-                    db, conv.id, settings.conversation_memory_turns
+                    db,
+                    conv.id,
+                    settings.conversation_memory_turns,
                 )
+
+                # ---------------------------------------------------------
+                # RAG only when required
+                # ---------------------------------------------------------
+
+                if intent == "rag":
+                    _cleaned, chunks = await retrieve(
+                        db,
+                        transcript,
+                        user_id,
+                        document_ids=doc_ids,
+                        conversation_id=conv.id,
+                        request_id=request_id,
+                    )
+                else:
+                    chunks = []
+
+                # ---------------------------------------------------------
+                # Build LLM messages
+                # ---------------------------------------------------------
+
                 messages = build_messages(
-                    transcript, chunks, history,
-                    query_language=detect_query_language(transcript),
+                    transcript,
+                    chunks,
+                    history,
+                    query_language=language_code,
                 )
+
+                # ---------------------------------------------------------
+                # Stream LLM response
+                # ---------------------------------------------------------
 
                 answer_parts: list[str] = []
+
                 async for delta in sarvam_client.chat_completion_stream(
-                    messages, db=db, conversation_id=conv.id, request_id=request_id
+                    messages,
+                    db=db,
+                    conversation_id=conv.id,
+                    request_id=request_id,
                 ):
                     answer_parts.append(delta)
-                    yield {"event": "token", "data": json.dumps({"delta": delta})}
+
+                    yield {
+                        "event": "token",
+                        "data": json.dumps(
+                            {
+                                "delta": delta
+                            }
+                        ),
+                    }
 
                 answer = "".join(answer_parts)
-                latency_ms = int((time.perf_counter() - started) * 1000)
-                name_map = await _doc_name_map(db, chunks)
-                await _persist_turn(
-                    db, conv, user_id, user_text=transcript,
-                    assistant_text=answer, input_type="voice",
-                    chunks=chunks, latency_ms=latency_ms, audio_key=audio_key,
+
+                latency_ms = int(
+                    (time.perf_counter() - started) * 1000
                 )
+
+                # ---------------------------------------------------------
+                # Persist conversation
+                # ---------------------------------------------------------
+
+                name_map = await _doc_name_map(
+                    db,
+                    chunks,
+                )
+
+                await _persist_turn(
+                    db,
+                    conv,
+                    user_id,
+                    user_text=transcript,
+                    assistant_text=answer,
+                    input_type="voice",
+                    chunks=chunks,
+                    latency_ms=latency_ms,
+                    audio_key=audio_key,
+                )
+
                 await db.commit()
 
-                yield {"event": "sources", "data": json.dumps({
-                    "conversation_id": str(conv.id),
-                    "sources": [s.model_dump(mode="json")
-                                for s in _build_sources(chunks, name_map)],
-                })}
-                yield {"event": "done", "data": json.dumps({"ok": True})}
+                # ---------------------------------------------------------
+                # Sources
+                # ---------------------------------------------------------
+
+                yield {
+                    "event": "sources",
+                    "data": json.dumps(
+                        {
+                            "conversation_id": str(conv.id),
+                            "sources": [
+                                s.model_dump(mode="json")
+                                for s in _build_sources(
+                                    chunks,
+                                    name_map,
+                                )
+                            ],
+                        }
+                    ),
+                }
+
+                yield {
+                    "event": "done",
+                    "data": json.dumps(
+                        {
+                            "ok": True
+                        }
+                    ),
+                }
+
             except Exception as exc:  # noqa: BLE001
                 await db.rollback()
-                log.exception("chat.voice_stream_failed")
-                yield {"event": "error", "data": json.dumps({"detail": str(exc)})}
+
+                log.exception(
+                    "chat.voice_stream_failed"
+                )
+
+                yield {
+                    "event": "error",
+                    "data": json.dumps(
+                        {
+                            "detail": str(exc)
+                        }
+                    ),
+                }
 
     return EventSourceResponse(event_gen())
 # --------------------------------------------------------------------------- #
-# Voice — STT only
+# Voice â€” STT only
 # --------------------------------------------------------------------------- #
 @router.post("/voice/transcribe", summary="Transcribe microphone audio")
 async def transcribe_voice(
