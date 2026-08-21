@@ -1,352 +1,38 @@
 ﻿import io
+import re
 import uuid
 import base64
 import requests
 import streamlit as st
-import threading
-import queue
-import numpy as np
-import av
-import time
-import wave
+from audio_recorder_streamlit import audio_recorder
 
-from streamlit_webrtc import webrtc_streamer
+def clean_answer(text):
+    if not text:
+        return ""
 
-import sys
-from pathlib import Path
+    # Remove leftover empty citation brackets such as [] or [   ]
+    text = re.sub(r"\[\s*\]", "", text)
 
-ANC_PATH = (
-    Path(__file__).resolve().parent
-    / "tools"
-    / "Active-Noise-Cancelling"
-)
+    # Remove extra spaces created after removing []
+    text = re.sub(r"[ \t]{2,}", " ", text)
 
-if str(ANC_PATH) not in sys.path:
-    sys.path.insert(0, str(ANC_PATH))
+    # Clean spaces before punctuation
+    text = re.sub(r"\s+([,.!?;:])", r"\1", text)
 
-from dsp import NoiseSuppressor
+    return text.strip()
 
-def denoise_audio(audio_bytes: bytes) -> bytes:
-    """
-    Apply Active-Noise-Cancelling DSP to recorded WAV audio.
-    Converts stereo input to mono and returns denoised WAV bytes.
-    """
-    import io
-    import wave
-    import numpy as np
-
-    with wave.open(io.BytesIO(audio_bytes), "rb") as wav:
-        channels = wav.getnchannels()
-        sample_width = wav.getsampwidth()
-        wav_rate = wav.getframerate()
-        frames = wav.readframes(wav.getnframes())
-
-    if sample_width != 2:
-        raise ValueError(
-            f"Expected 16-bit PCM audio, got sample width={sample_width}"
-        )
-
-    audio = np.frombuffer(
-        frames,
-        dtype=np.int16,
-    ).astype(np.float32)
-
-    # ---------------------------------------------------------
-    # Convert stereo/multi-channel audio to mono
-    # ---------------------------------------------------------
-
-    if channels > 1:
-        audio = audio.reshape(-1, channels)
-        audio = audio.mean(axis=1)
-
-    audio /= 32768.0
-
-    # ---------------------------------------------------------
-    # Noise suppressor
-    # ---------------------------------------------------------
-
-    suppressor = NoiseSuppressor(
-        sr=wav_rate,
-        frame_ms=20,
-        beta=1.0,
-        noise_floor=0.02,
-        ema_alpha=0.96,
-        gain_smooth=0.8,
-        highpass_hz=80.0,
-    )
-
-    hop = suppressor.hop
-
-    # Pad to complete hop
-    padding = (-len(audio)) % hop
-
-    if padding:
-        audio = np.pad(
-            audio,
-            (0, padding),
-        )
-
-    denoised_chunks = []
-
-    for start in range(0, len(audio), hop):
-        chunk = audio[start:start + hop].astype(np.float32)
-
-        denoised = suppressor.process(chunk)
-
-        denoised_chunks.append(denoised)
-
-    denoised_audio = np.concatenate(denoised_chunks)
-
-    denoised_audio = np.clip(
-        denoised_audio,
-        -1.0,
-        1.0,
-    )
-
-    output = (
-        denoised_audio * 32767.0
-    ).astype(np.int16)
-
-    output_buffer = io.BytesIO()
-
-    with wave.open(output_buffer, "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(wav_rate)
-        wav.writeframes(output.tobytes())
-
-    return output_buffer.getvalue()
-
-# ---------------------------------------------------------------------------
-# Live microphone state
-# ---------------------------------------------------------------------------
-
-def create_audio_state():
-    return {
-        "lock": threading.Lock(),
-
-        # Current recording buffer
-        "buffer": [],
-
-        # Recording state
-        "recording": False,
-        "recording_started": 0.0,
-
-        # First recording = exactly 5 seconds
-        "initial_recording": True,
-
-        # After initial recording, wait for speech
-        "waiting_for_speech": True,
-
-        # Completed audio waiting for processing
-        "completed_audio": None,
-
-        # Audio properties
-        "sample_rate": 48000,
-
-        # VAD
-        "noise_floor": 0.005,
-        "speech_active": False,
-        "last_voice_time": 0.0,
-
-        # TTS interruption
-        "interrupt": False,
-
-        # Cancel
-        "cancel": False,
-    }
-
-
-def create_audio_callback(state):
-    
-    INITIAL_RECORD_SECONDS = 5.0
-    SILENCE_SECONDS = 0.8
-    SPEECH_THRESHOLD = 0.015
-
-    def audio_frame_callback(frame: av.AudioFrame):
-
-        try:
-            samples = frame.to_ndarray()
-
-            if samples.ndim > 1:
-                samples = np.mean(
-                    samples,
-                    axis=0,
-                )
-
-            samples = samples.astype(np.float32)
-
-            if np.max(np.abs(samples)) > 1.5:
-                samples /= 32768.0
-
-            now = time.monotonic()
-
-            rms = float(
-                np.sqrt(
-                    np.mean(samples * samples)
-                )
-            )
-
-            with state["lock"]:
-
-                state["sample_rate"] = (
-                    frame.sample_rate or 48000
-                )
-
-                # -------------------------------------------------
-                # Cancel
-                # -------------------------------------------------
-
-                if state["cancel"]:
-                    state["buffer"] = []
-                    state["recording"] = False
-                    state["recording_started"] = 0.0
-                    state["speech_active"] = False
-                    state["cancel"] = False
-
-                # -------------------------------------------------
-                # INITIAL QUERY
-                # Record exactly 5 seconds.
-                # -------------------------------------------------
-
-                if state["initial_recording"]:
-
-                    if not state["recording"]:
-
-                        state["recording"] = True
-                        state["recording_started"] = now
-                        state["buffer"] = []
-
-                        print(
-                            "DEBUG: Initial 5-second recording started"
-                        )
-
-                    state["buffer"].append(
-                        samples.copy()
-                    )
-
-                    if (
-                        now
-                        - state["recording_started"]
-                        >= INITIAL_RECORD_SECONDS
-                    ):
-
-                        state["completed_audio"] = (
-                            np.concatenate(
-                                state["buffer"]
-                            ),
-                            state["sample_rate"],
-                        )
-
-                        state["buffer"] = []
-                        state["recording"] = False
-                        state["initial_recording"] = False
-                        state["waiting_for_speech"] = True
-
-                        print(
-                            "DEBUG: Initial 5-second recording completed"
-                        )
-
-                # -------------------------------------------------
-                # AFTER INITIAL QUERY
-                # Wait for speech, then record until silence.
-                # -------------------------------------------------
-
-                elif state["waiting_for_speech"]:
-
-                    threshold = max(
-                        SPEECH_THRESHOLD,
-                        state["noise_floor"] * 3.0,
-                    )
-
-                    if rms > threshold:
-
-                        state["waiting_for_speech"] = False
-                        state["recording"] = True
-                        state["speech_active"] = True
-                        state["recording_started"] = now
-                        state["last_voice_time"] = now
-                        state["buffer"] = [
-                            samples.copy()
-                        ]
-
-                        # Tell Streamlit to stop TTS.
-                        state["interrupt"] = True
-
-                        print(
-                            "DEBUG: Interruption speech detected"
-                        )
-
-                    elif rms < 0.02:
-
-                        state["noise_floor"] = (
-                            0.98 * state["noise_floor"]
-                            + 0.02 * rms
-                        )
-
-                # -------------------------------------------------
-                # INTERRUPTION RECORDING
-                # No 5-second limit here.
-                # -------------------------------------------------
-
-                elif state["recording"]:
-
-                    state["buffer"].append(
-                        samples.copy()
-                    )
-
-                    threshold = max(
-                        SPEECH_THRESHOLD,
-                        state["noise_floor"] * 3.0,
-                    )
-
-                    if rms > threshold:
-
-                        state["last_voice_time"] = now
-                        state["speech_active"] = True
-
-                    elif state["speech_active"]:
-
-                        if (
-                            now
-                            - state["last_voice_time"]
-                            >= SILENCE_SECONDS
-                        ):
-
-                            state["completed_audio"] = (
-                                np.concatenate(
-                                    state["buffer"]
-                                ),
-                                state["sample_rate"],
-                            )
-
-                            state["buffer"] = []
-                            state["recording"] = False
-                            state["speech_active"] = False
-                            state["waiting_for_speech"] = True
-
-                            print(
-                                "DEBUG: Interruption recording completed"
-                            )
-
-            # Do not send microphone audio back to browser.
-            return None
-
-        except Exception as exc:
-
-            print(
-                "WARNING: audio callback error:",
-                exc,
-            )
-
-            return None
-
-    return audio_frame_callback
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 API_BASE_URL = "http://localhost:8000"
+
+LANGUAGES = {
+    "English": "en-IN",
+    "Hindi": "hi-IN",
+    "Kannada": "kn-IN",
+    "Assamese": "as-IN",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -354,15 +40,76 @@ API_BASE_URL = "http://localhost:8000"
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="Assamese RAG Voice Assistant",
+    page_title="Multilingual RAG Voice Assistant",
     page_icon="🎤",
     layout="wide",
 )
 
-st.title("🎤Assamese RAG Voice Assistant")
+
+# ---------------------------------------------------------------------------
+# Language Selection
+# ---------------------------------------------------------------------------
+
+LANGUAGES = {
+    "English": "en",
+    "Hindi": "hi",
+    "Kannada": "kn",
+    "Assamese": "as",
+}
+
+if "language" not in st.session_state:
+    st.session_state["language"] = None
+
+st.subheader("🌐 Select Language")
+
+selected_language = st.selectbox(
+    "Choose the language for your conversation",
+    options=list(LANGUAGES.keys()),
+    index=(
+        list(LANGUAGES.keys()).index(st.session_state["language"])
+        if st.session_state["language"] in LANGUAGES
+        else 0
+    ),
+    key="language_selector",
+)
+
+selected_code = LANGUAGES[selected_language]
+
+# Detect language change
+if st.session_state.get("language") != selected_language:
+
+    st.session_state["language"] = selected_language
+
+    # Clear previous conversation/results when language changes
+    keys_to_clear = [
+        "transcript",
+        "stt_data",
+        "voice_result",
+        "text_answer",
+    ]
+
+    for key in keys_to_clear:
+        st.session_state.pop(key, None)
+
+    st.rerun()
+
+
+# ===========================================================================
+# SELECTED LANGUAGE
+# ===========================================================================
+
+selected_language = st.session_state["selected_language"]
+language_code = LANGUAGES[selected_language]
+
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+
+st.title("🎤 Multilingual RAG Voice Assistant")
 
 st.caption(
-    "Microphone → STT → RAG → Answer"
+    f"Current language: **{selected_language}** ({language_code})"
 )
 
 
@@ -385,6 +132,26 @@ request_id = st.sidebar.text_input(
 st.sidebar.write("API:")
 st.sidebar.code(API_BASE_URL)
 
+st.sidebar.divider()
+
+st.sidebar.write("Selected Language:")
+st.sidebar.success(
+    f"{selected_language} ({language_code})"
+)
+
+if st.sidebar.button("🌐 Change Language"):
+    st.session_state["selected_language"] = None
+
+    # Clear previous language-specific results
+    for key in [
+        "transcript",
+        "stt_data",
+        "voice_result",
+    ]:
+        st.session_state.pop(key, None)
+
+    st.rerun()
+
 
 # ---------------------------------------------------------------------------
 # Helper
@@ -394,6 +161,9 @@ def get_headers():
     return {
         "X-User-Id": user_id,
         "X-Request-Id": request_id,
+
+        # Selected language
+        "X-Language": language_code,
     }
 
 
@@ -401,549 +171,370 @@ def get_headers():
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab_voice, tab_text = st.tabs(
-    ["🎤 Voice", "💬 Text Chat"]
+tab_upload, tab_voice, tab_text = st.tabs(
+    [
+        "📄 Upload Document",
+        "🎤 Voice",
+        "💬 Text Chat",
+    ]
 )
+
+
+# ===========================================================================
+# DOCUMENT UPLOAD TAB
+# ===========================================================================
+
+with tab_upload:
+
+    st.header("📄 Upload Document")
+
+    st.write(
+        "Upload a PDF document. The existing backend ingestion pipeline "
+        "will handle parsing, chunking, embeddings, and indexing."
+    )
+
+    uploaded_file = st.file_uploader(
+        "Choose a PDF file",
+        type=["pdf"],
+    )
+
+    if uploaded_file:
+
+        st.success(
+            f"Selected: {uploaded_file.name}"
+        )
+
+        st.write(
+            f"File size: {uploaded_file.size:,} bytes"
+        )
+
+        if st.button(
+            "📤 Upload & Ingest",
+            type="primary",
+            key="upload_document_button",
+        ):
+
+            with st.spinner("Uploading and starting ingestion..."):
+
+                try:
+
+                    files = {
+                        "file": (
+                            uploaded_file.name,
+                            uploaded_file.getvalue(),
+                            "application/pdf",
+                        )
+                    }
+
+                    response = requests.post(
+                        f"{API_BASE_URL}/api/v1/documents",
+                        headers=get_headers(),
+                        files=files,
+                        timeout=300,
+                    )
+
+                    if response.ok:
+
+                        data = response.json()
+
+                        st.success(
+                            "✅ Document uploaded successfully!"
+                        )
+
+                        st.subheader("Ingestion Response")
+
+                        st.json(data)
+
+                    else:
+
+                        st.error(
+                            f"❌ Upload failed ({response.status_code})"
+                        )
+
+                        st.code(response.text)
+
+                except Exception as e:
+
+                    st.error(
+                        f"❌ Request failed: {e}"
+                    )
+            # ---------------------------------------------------------------
+            # We will connect your existing Swagger ingestion endpoint here.
+            #
+            # DO NOT change the backend ingestion logic.
+            # ---------------------------------------------------------------
+
+            # Example structure:
+            #
+            # files = {
+            #     "file": (
+            #         uploaded_file.name,
+            #         uploaded_file.getvalue(),
+            #         "application/pdf",
+            #     )
+            # }
+            #
+            # response = requests.post(
+            #     f"{API_BASE_URL}/YOUR_INGEST_ENDPOINT",
+            #     headers=get_headers(),
+            #     files=files,
+            #     timeout=300,
+            # )
+
+
 # ===========================================================================
 # VOICE TAB
 # ===========================================================================
 
 with tab_voice:
 
-    st.header("🎤 Voice Assistant")
+    st.header("Voice Testing")
 
-    st.caption(
-        "Speak naturally with the assistant."
+    st.write(
+        f"Record your question in **{selected_language}**."
     )
 
     # -----------------------------------------------------------------------
-    # Conversation state
+    # Recorder
     # -----------------------------------------------------------------------
 
-    if "voice_conversation_id" not in st.session_state:
-        st.session_state["voice_conversation_id"] = None
-
-    if "voice_messages" not in st.session_state:
-        st.session_state["voice_messages"] = []
-
-    if "assistant_audio" not in st.session_state:
-        st.session_state["assistant_audio"] = None
-
-    if "last_audio_hash" not in st.session_state:
-        st.session_state["last_audio_hash"] = None
-
-    # -----------------------------------------------------------------------
-    # New conversation
-    # -----------------------------------------------------------------------
-
-    if st.button(
-        "ðŸ”„ New Conversation",
-        key="new_voice_conversation",
-    ):
-        st.session_state["voice_conversation_id"] = None
-        st.session_state["voice_messages"] = []
-        st.session_state["assistant_audio"] = None
-        st.session_state["last_audio_hash"] = None
-        st.rerun()
-
-    # -----------------------------------------------------------------------
-    # Always-on microphone
-    # -----------------------------------------------------------------------
-    if "audio_state" not in st.session_state:
-        st.session_state["audio_state"] = create_audio_state()
-
-    audio_state = st.session_state["audio_state"]
-
-    audio_callback = create_audio_callback(
-        audio_state
-    )
-    webrtc_ctx = webrtc_streamer(
-    key="voice_microphone",
-    desired_playing_state=True,
-    media_stream_constraints={
-        "audio": {
-            "echoCancellation": True,
-            "noiseSuppression": True,
-            "autoGainControl": True,
-        },
-        "video": False,
-    },
-    audio_frame_callback=audio_callback,
-    media_toggle_controls=False,
-)
-   
-
-
-# -----------------------------------------------------------------------
-# Microphone status indicator
-# -----------------------------------------------------------------------
-
-tts_until = st.session_state.get(
-    "tts_until",
-    0.0,
-)
-
-assistant_speaking = (
-    time.monotonic() < tts_until
-)
-
-if assistant_speaking:
-    st.markdown(
-        """
-        <div style="
-            display:flex;
-            align-items:center;
-            gap:8px;
-            margin:8px 0;
-            font-size:16px;
-            font-weight:600;
-        ">
-            <span style="
-                width:14px;
-                height:14px;
-                border-radius:50%;
-                background:#888;
-                display:inline-block;
-            "></span>
-            Assistant is speaking
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-else:
-    st.markdown(
-        """
-        <div style="
-            display:flex;
-            align-items:center;
-            gap:8px;
-            margin:8px 0;
-            font-size:16px;
-            font-weight:600;
-        ">
-            <span style="
-                width:14px;
-                height:14px;
-                border-radius:50%;
-                background:red;
-                display:inline-block;
-                box-shadow:0 0 8px rgba(255,0,0,0.7);
-            "></span>
-            Listening
-        </div>
-        """,
-        unsafe_allow_html=True,
+    audio_bytes = audio_recorder(
+        text="Click to record",
+        recording_color="#ff4b4b",
+        neutral_color="#6c757d",
+        icon_name="microphone",
+        icon_size="2x",
     )
 
+    if audio_bytes:
 
-# -----------------------------------------------------------------------
-# Voice status + transcription + Cancel
-# -----------------------------------------------------------------------
-
-if "voice_transcript" not in st.session_state:
-    st.session_state["voice_transcript"] = ""
-
-if "voice_processing" not in st.session_state:
-    st.session_state["voice_processing"] = False
-
-if st.session_state["voice_processing"]:
-
-    st.info(
-        "🎙️ Processing your voice..."
-    )
-
-elif st.session_state["voice_transcript"]:
-
-    st.markdown("### Transcription")
-
-    st.info(
-        st.session_state["voice_transcript"]
-    )
-
-else:
-
-    st.caption(
-        "🎙️ Listening for your voice..."
-    )
-
-if st.button(
-    "Cancel",
-    key="cancel_voice",
-):
-
-    with audio_state["lock"]:
-
-        audio_state["cancel"] = True
-        audio_state["buffer"] = []
-        audio_state["recording"] = False
-        audio_state["speech_active"] = False
-        audio_state["completed_audio"] = None
-
-        audio_state["initial_recording"] = True
-        audio_state["waiting_for_speech"] = True
-
-    st.session_state[
-        "voice_processing"
-    ] = False
-
-    st.session_state[
-        "assistant_audio"
-    ] = None
-
-    st.session_state[
-        "voice_transcript"
-    ] = ""
-
-    st.session_state[
-        "tts_until"
-    ] = 0.0
-
-    st.rerun()
-
-# -----------------------------------------------------------------------
-# Live microphone monitor
-# -----------------------------------------------------------------------
-
-@st.fragment(run_every="100ms")
-def monitor_microphone():
-
-    state = st.session_state["audio_state"]
-
-    interrupt = False
-    completed = None
-
-    # ---------------------------------------------------------------
-    # Read state from WebRTC callback
-    # ---------------------------------------------------------------
-
-    with state["lock"]:
-
-        if state["interrupt"]:
-
-            interrupt = True
-
-            state["interrupt"] = False
-
-        if state["completed_audio"] is not None:
-
-            completed = state["completed_audio"]
-
-            state["completed_audio"] = None
-
-    # ---------------------------------------------------------------
-    # User started speaking during TTS
-    # ---------------------------------------------------------------
-
-    if interrupt:
-
-        print(
-            "DEBUG: User speech detected - "
-            "interrupting assistant"
+        st.success(
+            f"Recording captured — {len(audio_bytes):,} bytes"
         )
 
-        st.session_state[
-            "assistant_audio"
-        ] = None
+        # -------------------------------------------------------------------
+        # Play recording
+        # -------------------------------------------------------------------
 
-        st.session_state[
-            "tts_until"
-        ] = 0.0
+        st.subheader("Your Recording")
 
-        st.session_state[
-            "voice_processing"
-        ] = True
-
-        st.rerun()
-
-    # ---------------------------------------------------------------
-    # No completed utterance yet
-    # ---------------------------------------------------------------
-
-    if completed is None:
-        return
-
-    # ---------------------------------------------------------------
-    # Completed user audio
-    # ---------------------------------------------------------------
-
-    samples, sample_rate = completed
-
-    print(
-        "DEBUG: User utterance captured:",
-        len(samples),
-        "samples @",
-        sample_rate,
-        "Hz",
-    )
-
-    st.session_state[
-        "voice_processing"
-    ] = True
-
-    # ---------------------------------------------------------------
-    # Convert to mono int16 WAV
-    # ---------------------------------------------------------------
-
-    samples = np.clip(
-        samples,
-        -1.0,
-        1.0,
-    )
-
-    pcm16 = (
-        samples * 32767
-    ).astype(np.int16)
-
-    wav_buffer = io.BytesIO()
-
-    with wave.open(
-        wav_buffer,
-        "wb",
-    ) as wav:
-
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(
-            int(sample_rate)
-        )
-        wav.writeframes(
-            pcm16.tobytes()
+        st.audio(
+            audio_bytes,
+            format="audio/wav",
         )
 
-    audio_bytes = wav_buffer.getvalue()
+        # -------------------------------------------------------------------
+        # STT
+        # -------------------------------------------------------------------
 
-    # ---------------------------------------------------------------
-    # Noise suppression
-    # ---------------------------------------------------------------
+        st.subheader("1️⃣ Speech-to-Text")
 
-    try:
+        if st.button(
+            "Transcribe Audio",
+            key="transcribe_button",
+            type="primary",
+        ):
 
-        audio_bytes = denoise_audio(
-            audio_bytes
-        )
+            with st.spinner(
+                f"Transcribing in {selected_language}..."
+            ):
 
-        print(
-            "DEBUG: Denoised audio:",
-            len(audio_bytes),
-            "bytes",
-        )
+                try:
 
-    except Exception as exc:
+                    files = {
+                        "file": (
+                            "recording.wav",
+                            io.BytesIO(audio_bytes),
+                            "audio/wav",
+                        )
+                    }
 
-        print(
-            "WARNING: Noise suppression failed:",
-            exc,
-        )
+                    response = requests.post(
+                        f"{API_BASE_URL}/api/v1/chat/voice/transcribe",
+                        headers=get_headers(),
+                        files=files,
+                        timeout=120,
+                    )
 
-    # ---------------------------------------------------------------
-    # Send to FastAPI
-    # ---------------------------------------------------------------
+                    if response.ok:
 
-    try:
+                        data = response.json()
 
-        files = {
-            "file": (
-                "recording.wav",
-                io.BytesIO(audio_bytes),
-                "audio/wav",
-            )
-        }
+                        st.session_state["transcript"] = (
+                            data.get("transcript", "")
+                        )
 
-        data = {}
+                        st.session_state["stt_data"] = data
 
-        conversation_id = (
-            st.session_state.get(
-                "voice_conversation_id"
-            )
-        )
+                    else:
 
-        if conversation_id:
+                        st.error(
+                            f"STT failed ({response.status_code})"
+                        )
 
-            data["conversation_id"] = (
-                conversation_id
+                        st.code(response.text)
+
+                except Exception as e:
+
+                    st.error(
+                        f"Request failed: {e}"
+                    )
+
+        # -------------------------------------------------------------------
+        # Display transcript
+        # -------------------------------------------------------------------
+
+        if "transcript" in st.session_state:
+
+            st.subheader("📝 Transcript")
+
+            st.text_area(
+                "STT Output",
+                value=st.session_state["transcript"],
+                height=120,
+                disabled=True,
             )
 
-        response = requests.post(
-            f"{API_BASE_URL}/api/v1/chat/voice",
-            headers=get_headers(),
-            files=files,
-            data=data,
-            timeout=180,
-        )
-
-        if not response.ok:
-
-            st.session_state[
-                "voice_processing"
-            ] = False
-
-            st.error(
-                f"Voice request failed "
-                f"({response.status_code})"
-            )
-
-            st.code(
-                response.text
-            )
-
-            return
-
-        result = response.json()
-
-        # -----------------------------------------------------------
-        # Show transcription
-        # -----------------------------------------------------------
-
-        transcript = (
-            result.get("transcript")
-            or ""
-        )
-
-        st.session_state[
-            "voice_transcript"
-        ] = transcript
-
-        print(
-            "DEBUG: Transcript:",
-            transcript,
-        )
-
-        # -----------------------------------------------------------
-        # Conversation ID
-        # -----------------------------------------------------------
-
-        new_conversation_id = (
-            result.get(
-                "conversation_id"
-            )
-        )
-
-        if new_conversation_id:
-
-            st.session_state[
-                "voice_conversation_id"
-            ] = new_conversation_id
-
-        # -----------------------------------------------------------
-        # TTS
-        # -----------------------------------------------------------
-
-        audio_base64 = (
-            result.get("audio_base64")
-        )
-
-        if not audio_base64:
-
-            st.session_state[
-                "voice_processing"
-            ] = False
-
-            st.error(
-                "Backend did not return TTS audio."
-            )
-
-            return
-
-        audio_bytes = base64.b64decode(
-            audio_base64
-        )
-
-        st.session_state[
-            "assistant_audio"
-        ] = audio_bytes
-
-        # -----------------------------------------------------------
-        # Calculate TTS duration
-        # -----------------------------------------------------------
-
-        try:
-
-            with wave.open(
-                io.BytesIO(audio_bytes),
-                "rb",
-            ) as wav:
-
-                frames = wav.getnframes()
-
-                sample_rate = (
-                    wav.getframerate()
+            st.write(
+                st.session_state.get(
+                    "stt_data",
+                    {},
                 )
-
-                duration = (
-                    frames / sample_rate
-                    if sample_rate
-                    else 0
-                )
-
-            st.session_state[
-                "tts_until"
-            ] = (
-                time.monotonic()
-                + duration
             )
 
-        except Exception as exc:
+        # -------------------------------------------------------------------
+        # Full voice RAG
+        # -------------------------------------------------------------------
 
-            print(
-                "WARNING: Could not calculate "
-                f"TTS duration: {exc}"
+        st.subheader("2️⃣ Voice → RAG → Answer")
+
+        if st.button(
+            "Ask RAG Using This Audio",
+            key="voice_rag_button",
+        ):
+
+            with st.spinner(
+                "Running STT → Retrieval → LLM..."
+            ):
+
+                try:
+
+                    files = {
+                        "file": (
+                            "recording.wav",
+                            io.BytesIO(audio_bytes),
+                            "audio/wav",
+                        )
+                    }
+
+                    response = requests.post(
+                        f"{API_BASE_URL}/api/v1/chat/voice",
+                        headers=get_headers(),
+                        files=files,
+                        timeout=180,
+                    )
+
+                    if response.ok:
+
+                        data = response.json()
+
+                        st.session_state["voice_result"] = data
+
+                    else:
+
+                        st.error(
+                            f"Voice RAG failed ({response.status_code})"
+                        )
+
+                        st.code(response.text)
+
+                except Exception as e:
+
+                    st.error(
+                        f"Request failed: {e}"
+                    )
+
+        # -------------------------------------------------------------------
+        # Display RAG result
+        # -------------------------------------------------------------------
+
+        if "voice_result" in st.session_state:
+
+            result = st.session_state["voice_result"]
+
+            st.subheader("📝 Transcribed Question")
+
+            st.text_area(
+                "Question",
+                value=result.get("transcript", ""),
+                height=100,
+                disabled=True,
             )
 
-            st.session_state[
-                "tts_until"
-            ] = (
-                time.monotonic()
-                + 10.0
+            st.subheader("🤖 RAG Answer")
+
+            answer = clean_answer(result.get("answer", ""))
+
+            st.write(answer)
+
+            # ---------------------------------------------------------------
+            # TTS Audio
+            # ---------------------------------------------------------------
+
+            audio_base64 = result.get(
+                "audio_base64"
             )
 
-        st.session_state[
-            "voice_processing"
-        ] = False
+            if audio_base64:
 
-        st.rerun()
+                try:
 
-    except Exception as exc:
+                    audio_bytes = base64.b64decode(
+                        audio_base64
+                    )
 
-        st.session_state[
-            "voice_processing"
-        ] = False
+                    st.subheader(
+                        "🔊 Assistant Voice"
+                    )
 
-        st.error(
-            f"Voice request failed: {exc}"
-        )
+                    st.audio(
+                        audio_bytes,
+                        format="audio/wav",
+                    )
 
+                except Exception as e:
 
-monitor_microphone()
-    
+                    st.error(
+                        f"Could not play assistant audio: {e}"
+                    )
 
-# -----------------------------------------------------------------------
-# TTS PLAYBACK
-# -----------------------------------------------------------------------
+            # ---------------------------------------------------------------
+            # Sources
+            # ---------------------------------------------------------------
 
-if st.session_state.get("assistant_audio"):
+            sources = result.get(
+                "sources",
+                [],
+            )
 
-    audio_b64 = base64.b64encode(
-        st.session_state["assistant_audio"]
-    ).decode("utf-8")
+            if sources:
 
-    st.components.v1.html(
-        f"""
-        <audio
-            id="assistantAudio"
-            autoplay
-        >
-            <source
-                src="data:audio/wav;base64,{audio_b64}"
-                type="audio/wav"
-            >
-        </audio>
-        """,
-        height=0,
-    )
+                with st.expander(
+                    f"📚 Sources ({len(sources)})"
+                ):
 
-    
+                    for i, source in enumerate(
+                        sources,
+                        start=1,
+                    ):
 
+                        st.markdown(
+                            f"**Source {i}**"
+                        )
 
+                        st.write(
+                            source
+                        )
 
 
 # ===========================================================================
@@ -954,9 +545,15 @@ with tab_text:
 
     st.header("Text Chat")
 
+    st.write(
+        f"Ask questions only in **{selected_language}**."
+    )
+
     text_question = st.text_area(
         "Enter your question",
-        placeholder="Ask something about the uploaded documents...",
+        placeholder=(
+            f"Type your question in {selected_language}..."
+        ),
         height=120,
     )
 
@@ -982,6 +579,7 @@ with tab_text:
 
                     payload = {
                         "message": text_question,
+                        
                     }
 
                     response = requests.post(
@@ -996,12 +594,12 @@ with tab_text:
                         data = response.json()
 
                         st.subheader(
-                            "ðŸ¤– Answer"
+                            "🤖 Answer"
                         )
 
-                        st.write(
-                            data.get("answer", "")
-                        )
+                        answer = clean_answer(data.get("answer", ""))
+
+                        st.write(answer)
 
                         sources = data.get(
                             "sources",
@@ -1011,7 +609,7 @@ with tab_text:
                         if sources:
 
                             with st.expander(
-                                f"ðŸ“š Sources ({len(sources)})"
+                                f"📚 Sources ({len(sources)})"
                             ):
 
                                 for i, source in enumerate(

@@ -1,0 +1,3 @@
+[submodule "ten"]
+	path = ten
+	url = https://github.com/TEN-framework/ten-framework.git
