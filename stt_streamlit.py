@@ -1,19 +1,24 @@
-﻿import io
+import io
 import re
 import uuid
 import base64
 import requests
 import streamlit as st
 from audio_recorder_streamlit import audio_recorder
+from voice_component import voice_component
 
 def clean_answer(text):
     if not text:
         return ""
 
-    # Remove leftover empty citation brackets such as [] or [   ]
+    # Remove source citations such as [s1], [s1, s2], or standalone s1.
+    text = re.sub(r"\[\s*s\d+(?:\s*,\s*s\d+)*\s*\]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<!\w)s\d+(?!\w)", "", text, flags=re.IGNORECASE)
+
+    # Remove leftover empty citation brackets such as [] or [   ].
     text = re.sub(r"\[\s*\]", "", text)
 
-    # Remove extra spaces created after removing []
+    # Remove extra spaces created after removing citations.
     text = re.sub(r"[ \t]{2,}", " ", text)
 
     # Clean spaces before punctuation
@@ -58,25 +63,21 @@ LANGUAGES = {
 }
 
 if "language" not in st.session_state:
-    st.session_state["language"] = None
+    st.session_state["language"] = "English"
 
 st.subheader("🌐 Select Language")
 
 selected_language = st.selectbox(
     "Choose the language for your conversation",
     options=list(LANGUAGES.keys()),
-    index=(
-        list(LANGUAGES.keys()).index(st.session_state["language"])
-        if st.session_state["language"] in LANGUAGES
-        else 0
-    ),
+    index=list(LANGUAGES.keys()).index(st.session_state["language"]),
     key="language_selector",
 )
 
 selected_code = LANGUAGES[selected_language]
 
 # Detect language change
-if st.session_state.get("language") != selected_language:
+if st.session_state["language"] != selected_language:
 
     st.session_state["language"] = selected_language
 
@@ -97,8 +98,7 @@ if st.session_state.get("language") != selected_language:
 # ===========================================================================
 # SELECTED LANGUAGE
 # ===========================================================================
-
-selected_language = st.session_state["selected_language"]
+selected_language = st.session_state.get("language", "English")
 language_code = LANGUAGES[selected_language]
 
 
@@ -140,7 +140,7 @@ st.sidebar.success(
 )
 
 if st.sidebar.button("🌐 Change Language"):
-    st.session_state["selected_language"] = None
+    st.session_state["language"] = None
 
     # Clear previous language-specific results
     for key in [
@@ -171,10 +171,11 @@ def get_headers():
 # Tabs
 # ---------------------------------------------------------------------------
 
-tab_upload, tab_voice, tab_text = st.tabs(
+tab_upload, tab_continuous_voice, tab_voice, tab_text = st.tabs(
     [
         "📄 Upload Document",
-        "🎤 Voice",
+        "🚀 Intelligent Voice AI",
+        "🎤 Voice AI",
         "💬 Text Chat",
     ]
 )
@@ -283,12 +284,27 @@ with tab_upload:
 
 
 # ===========================================================================
-# VOICE TAB
+# INTELLIGENT VOICE AI TAB
+# ===========================================================================
+
+with tab_continuous_voice:
+    st.header("🚀 Intelligent Voice AI")
+    st.write(
+        "This mode supports continuous listening and interruption (barge-in). "
+        "When the assistant is speaking, you can start talking to interrupt it."
+    )
+    
+    # Render the custom voice component
+    voice_component()
+
+
+# ===========================================================================
+# VOICE AI TAB
 # ===========================================================================
 
 with tab_voice:
 
-    st.header("Voice Testing")
+    st.header("Voice AI")
 
     st.write(
         f"Record your question in **{selected_language}**."
@@ -300,10 +316,13 @@ with tab_voice:
 
     audio_bytes = audio_recorder(
         text="Click to record",
+        # Keep recording through normal pauses; click the mic to stop it.
+        pause_threshold=3600,
         recording_color="#ff4b4b",
         neutral_color="#6c757d",
         icon_name="microphone",
         icon_size="2x",
+        key="voice_ai_recorder",
     )
 
     if audio_bytes:
